@@ -403,7 +403,7 @@ class SenatraTokenReducer(nn.Module):
         dense.reshape(batch_size, self.n_in * self.n_out).scatter_add_(1, flat_idx, values)
         return dense
 
-    def forward(self, x, return_assignments=True):
+    def forward(self, x, return_assignments=True, external_keys=None):
         batch_size, num_tokens, channels = x.shape
         if num_tokens != self.n_in:
             raise ValueError(
@@ -417,7 +417,9 @@ class SenatraTokenReducer(nn.Module):
         xout = self.init_norm(xout)
 
         xin_normed = self.in_norm(x)
-        k = self.k_proj(xin_normed)
+        # Use external key vectors (e.g. from preceding ViT block's self-attention)
+        # instead of re-projecting the input, if provided.
+        k = self.k_proj(external_keys if external_keys is not None else xin_normed)
         v = self.v_proj(xin_normed)
 
         if self.use_local_grouping:
@@ -587,11 +589,22 @@ def default_vit14_schedule(final_grid=5):
     raise ValueError("final_grid must be 5 or 8")
 
 
+def resolve_reducer_grouping_mode(mode: str, reducer_idx: int, num_reducers: int) -> str:
+    """Return the grouping mode string for a specific reducer stage.
+
+    Currently passes the mode through unchanged. The last stage (smallest grid)
+    automatically falls back to dense if the token count is too small for NATTEN.
+    That fallback is handled inside SenatraTokenReducer itself.
+    """
+    return mode
+
+
 __all__ = [
     "SenatraTokenReducer",
     "SenatraTokenPyramid",
     "compose_assignment_chain",
     "compose_membership_map",
+    "resolve_reducer_grouping_mode",
     "segmentation_labels_from_aups",
     "segmentation_membership_grid_from_aups",
     "default_vit14_schedule",

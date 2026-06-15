@@ -1,4 +1,4 @@
-# train vit_senatra on imagenet
+# train vit_senatra on imagenet (RoPE positional encoding)
 
 import argparse
 import datetime
@@ -39,7 +39,7 @@ from senatra import (
     resolve_reducer_grouping_mode,
     segmentation_labels_from_aups,
 )
-from utils_vit_senatra import (
+from utils import (
     NativeScalerWithGradNormCount,
     auto_resume_helper,
     build_optimizer,
@@ -51,7 +51,14 @@ from utils_vit_senatra import (
     reduce_tensor,
     save_checkpoint,
 )
-from visiontransformer import Attention, Block, PatchEmbed, _init_vit_weights, named_apply, trunc_normal_
+from vision_transformer import (
+    DropPath,
+    Mlp,
+    PatchEmbed,
+    _init_vit_weights,
+    named_apply,
+    trunc_normal_,
+)
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -123,73 +130,130 @@ def _normalize_resolution_strings(resolutions):
 
 def _build_vit_senatra_name(variant, use_cls_token):
     suffix = "" if use_cls_token else "_nocls"
-    return f"{VIT_PRESETS[variant]['name']}_senatra{suffix}"
+    return f"{VIT_PRESETS[variant]['name']}_senatra_rope{suffix}"
 
 
-class AttentionWithKey(Attention):
-    def forward(self, x, return_key=False):
-        batch_size, num_tokens, dim = x.shape
-        qkv = self.qkv(x).reshape(
-            batch_size, num_tokens, 3, self.num_heads, dim // self.num_heads
-        ).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+# ---------------------------------------------------------------------------
+# RoPE utilities (axial 2D, adapted from rope-vit/self-attn/rope_self_attn.py)
+# ---------------------------------------------------------------------------
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+def _compute_axial_cis(head_dim: int, end_x: int, end_y: int, theta: float = 100.0) -> torch.Tensor:
+    """2D axial RoPE frequencies.  Returns complex tensor [end_x*end_y, head_dim//2]."""
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 4)[: (head_dim // 4)].float() / head_dim))
+    t = torch.arange(end_x * end_y, dtype=torch.float32)
+    t_x = (t % end_x).float()
+    t_y = torch.div(t, end_x, rounding_mode="floor").float()
+    outer_x = torch.outer(t_x, freqs)
+    outer_y = torch.outer(t_y, freqs)
+    return torch.cat(
+        [torch.polar(torch.ones_like(outer_x), outer_x),
+         torch.polar(torch.ones_like(outer_y), outer_y)],
+        dim=-1,
+    )  # [N, head_dim//2]
+
+
+def _apply_rotary_emb(xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor):
+    """xq, xk: [B, num_heads, N, head_dim]; freqs_cis: [N, head_dim//2] complex."""
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    fc = freqs_cis.unsqueeze(0).unsqueeze(0)   # [1, 1, N, head_dim//2]
+    xq_out = torch.view_as_real(xq_ * fc).flatten(3)
+    xk_out = torch.view_as_real(xk_ * fc).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# ---------------------------------------------------------------------------
+# RoPE-aware Attention
+# ---------------------------------------------------------------------------
+
+class RoPEAttention(nn.Module):
+    """Self-attention with 2D axial RoPE applied to patch tokens.
+
+    CLS token (num_prefix_tokens leading positions) is excluded from rotation.
+    When return_key=True, also returns the (post-RoPE) key tensor for SENATRA.
+    """
+
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0.0, proj_drop=0.0,
+                 num_prefix_tokens=1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_prefix_tokens = num_prefix_tokens
+        self.scale = (dim // num_heads) ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, freqs_cis: torch.Tensor, return_key: bool = False):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, H, N, head_dim]
+
+        n = self.num_prefix_tokens
+        fc = freqs_cis.to(q.device)
+        if n > 0:
+            q_r, k_r = _apply_rotary_emb(q[:, :, n:], k[:, :, n:], fc)
+            q = torch.cat([q[:, :, :n], q_r], dim=2)
+            k = torch.cat([k[:, :, :n], k_r], dim=2)
+        else:
+            q, k = _apply_rotary_emb(q, k, fc)
+
+        attn = (q * self.scale) @ k.transpose(-2, -1)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(batch_size, num_tokens, dim)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 
         if return_key:
-            key_tokens = k.transpose(1, 2).reshape(batch_size, num_tokens, dim)
+            # Merge heads back to [B, N, C] for SENATRA external_keys
+            key_tokens = k.transpose(1, 2).reshape(B, N, C)
             return x, key_tokens
         return x
 
 
-class BlockWithKey(Block):
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        mlp_ratio=4.0,
-        qkv_bias=False,
-        drop=0.0,
-        attn_drop=0.0,
-        drop_path_rate=0.0,
-        act_layer=nn.GELU,
-        norm_layer=nn.LayerNorm,
-    ):
-        super().__init__(
-            dim=dim,
-            num_heads=num_heads,
-            mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias,
-            drop=drop,
-            attn_drop=attn_drop,
-            drop_path_rate=drop_path_rate,
-            act_layer=act_layer,
-            norm_layer=norm_layer,
-        )
-        self.attn = AttentionWithKey(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            attn_drop=attn_drop,
-            proj_drop=drop,
-        )
+# ---------------------------------------------------------------------------
+# Transformer blocks
+# ---------------------------------------------------------------------------
 
-    def forward(self, x, return_key=False):
+class RoPEBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=False, drop=0.0,
+                 attn_drop=0.0, drop_path_rate=0.0, act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm, num_prefix_tokens=1):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = RoPEAttention(dim, num_heads=num_heads, qkv_bias=qkv_bias,
+                                   attn_drop=attn_drop, proj_drop=drop,
+                                   num_prefix_tokens=num_prefix_tokens)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio),
+                       act_layer=act_layer, drop=drop)
+
+    def forward(self, x, freqs_cis: torch.Tensor):
+        x = x + self.drop_path(self.attn(self.norm1(x), freqs_cis))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class RoPEBlockWithKey(RoPEBlock):
+    """Block that can additionally return key vectors (for SENATRA external_keys)."""
+
+    def forward(self, x, freqs_cis: torch.Tensor, return_key: bool = False):
         if not return_key:
-            return super().forward(x)
+            return super().forward(x, freqs_cis)
 
         normed = self.norm1(x)
-        attn_out, key_tokens = self.attn(normed, return_key=True)
+        attn_out, key_tokens = self.attn(normed, freqs_cis, return_key=True)
         x = x + self.drop_path(attn_out)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x, key_tokens
 
+
+# ---------------------------------------------------------------------------
+# VisionTransformerSenatra  (no absolute pos_embed — uses RoPE)
+# ---------------------------------------------------------------------------
 
 class VisionTransformerSenatra(nn.Module):
     def __init__(
@@ -218,6 +282,7 @@ class VisionTransformerSenatra(nn.Module):
         senatra_grouping_mode="auto",
         use_cls_token=True,
         use_checkpoint=False,
+        rope_theta=100.0,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -262,16 +327,14 @@ class VisionTransformerSenatra(nn.Module):
             raise ValueError("senatra_insert_blocks must be within [1, depth-1] to leave post-reduction blocks")
         self.senatra_insert_block_set = set(self.senatra_insert_blocks)
 
+        # CLS token (no absolute pos_embed — position encoded by RoPE in attention)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim)) if self.use_cls_token else None
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.initial_num_patches + self.num_prefix_tokens, embed_dim)
-        )
-        self.pos_drop = nn.Dropout(p=drop_rate)
 
+        # Transformer blocks: blocks at reducer positions use RoPEBlockWithKey
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList(
             [
-                (BlockWithKey if (i + 1) in self.senatra_insert_block_set else Block)(
+                (RoPEBlockWithKey if (i + 1) in self.senatra_insert_block_set else RoPEBlock)(
                     dim=embed_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
@@ -281,11 +344,19 @@ class VisionTransformerSenatra(nn.Module):
                     drop_path_rate=dpr[i],
                     norm_layer=norm_layer,
                     act_layer=act_layer,
+                    num_prefix_tokens=self.num_prefix_tokens,
                 )
                 for i in range(depth)
             ]
         )
 
+        # Precompute axial RoPE frequencies for each resolution stage (no learned params)
+        head_dim = embed_dim // num_heads
+        self._rope_freqs: dict = {}
+        for res in [self.initial_resolution] + self.senatra_resolutions:
+            self._rope_freqs[res] = _compute_axial_cis(head_dim, res[0], res[1], theta=rope_theta)
+
+        # SENATRA token reducers
         reducers = []
         current_resolution = self.initial_resolution
         num_reducers = len(self.senatra_resolutions)
@@ -332,7 +403,6 @@ class VisionTransformerSenatra(nn.Module):
     def init_weights(self, mode=""):
         assert mode in ("jax", "jax_nlhb", "nlhb", "")
         head_bias = -math.log(self.num_classes) if "nlhb" in mode else 0.0
-        trunc_normal_(self.pos_embed, std=0.02)
         if self.cls_token is not None:
             trunc_normal_(self.cls_token, std=0.02)
         if mode.startswith("jax"):
@@ -340,31 +410,14 @@ class VisionTransformerSenatra(nn.Module):
         else:
             self.apply(_init_vit_weights)
 
-    def _resize_patch_pos_embed(self, resolution):
-        patch_pos = self.pos_embed[:, self.num_prefix_tokens :, :]
-        base_h, base_w = self.initial_resolution
-        if resolution == self.initial_resolution:
-            return patch_pos
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        # pos_embed removed; only cls_token (if used) skips weight decay
+        return {"cls_token"} if self.use_cls_token else set()
 
-        patch_pos = patch_pos.reshape(1, base_h, base_w, self.embed_dim).permute(0, 3, 1, 2)
-        patch_pos = torch.nn.functional.interpolate(
-            patch_pos,
-            size=resolution,
-            mode="bicubic",
-            align_corners=False,
-        )
-        return patch_pos.permute(0, 2, 3, 1).reshape(1, resolution[0] * resolution[1], self.embed_dim)
-
-    def _add_initial_position(self, patch_tokens):
-        patch_tokens = patch_tokens + self._resize_patch_pos_embed(self.initial_resolution)
-        if self.use_cls_token:
-            cls_token = self.cls_token.expand(patch_tokens.shape[0], -1, -1)
-            cls_pos = self.pos_embed[:, :1, :]
-            cls_token = cls_token + cls_pos
-            x = torch.cat((cls_token, patch_tokens), dim=1)
-        else:
-            x = patch_tokens
-        return self.pos_drop(x)
+    @torch.jit.ignore
+    def no_weight_decay_keywords(self):
+        return {"rel_bias", "rel_bias_local"}
 
     def _apply_reducer_with_keys(self, x, reducer_idx, key_tokens):
         reducer = self.reducers[reducer_idx]
@@ -383,7 +436,7 @@ class VisionTransformerSenatra(nn.Module):
             return_assignments=True,
             external_keys=key_tokens,
         )
-        patch_tokens = patch_tokens + self._resize_patch_pos_embed(target_resolution)
+        # No pos_embed re-injection: RoPE in subsequent blocks uses the new grid coords.
 
         if cls_token is not None:
             x = torch.cat((cls_token, patch_tokens), dim=1)
@@ -391,43 +444,47 @@ class VisionTransformerSenatra(nn.Module):
             x = patch_tokens
         return x, aups, adown
 
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        names = {"pos_embed"}
-        if self.use_cls_token:
-            names.add("cls_token")
-        return names
-
-    @torch.jit.ignore
-    def no_weight_decay_keywords(self):
-        return {"rel_bias", "rel_bias_local"}
-
     def forward_features(self, x, return_assignments=True):
         aups_list = []
         adown_list = []
 
         patch_tokens = self.patch_embed(x)
-        x = self._add_initial_position(patch_tokens)
+        if self.use_cls_token:
+            cls_token = self.cls_token.expand(patch_tokens.shape[0], -1, -1)
+            x = torch.cat((cls_token, patch_tokens), dim=1)
+        else:
+            x = patch_tokens
+
+        # Track current spatial resolution to pick the right RoPE freqs
+        current_res = self.initial_resolution
+        freqs_cis = self._rope_freqs[current_res]
 
         for block_idx, blk in enumerate(self.blocks, start=1):
             if block_idx in self.reducer_map:
                 if self.use_checkpoint:
+                    fc = freqs_cis
                     x, key_tokens = checkpoint.checkpoint(
-                        lambda inp: blk(inp, return_key=True),
-                        x,
+                        lambda inp, fc=fc: blk(inp, fc, return_key=True), x
                     )
                 else:
-                    x, key_tokens = blk(x, return_key=True)
+                    x, key_tokens = blk(x, freqs_cis, return_key=True)
+
                 x, aups, adown = self._apply_reducer_with_keys(
-                    x,
-                    self.reducer_map[block_idx],
-                    key_tokens,
+                    x, self.reducer_map[block_idx], key_tokens,
                 )
                 if return_assignments:
                     aups_list.append(aups)
                     adown_list.append(adown)
+
+                # Switch to the RoPE freqs for the new (reduced) resolution
+                current_res = self.senatra_resolutions[self.reducer_map[block_idx]]
+                freqs_cis = self._rope_freqs[current_res]
             else:
-                x = checkpoint.checkpoint(blk, x) if self.use_checkpoint else blk(x)
+                if self.use_checkpoint:
+                    fc = freqs_cis
+                    x = checkpoint.checkpoint(lambda inp, fc=fc: blk(inp, fc), x)
+                else:
+                    x = blk(x, freqs_cis)
 
         x = self.norm(x)
         if self.use_cls_token:
@@ -528,6 +585,7 @@ def build_model(config):
         senatra_grouping_mode=senatra.GROUPING_MODE,
         use_cls_token=config.MODEL.USE_CLS_TOKEN,
         use_checkpoint=config.TRAIN.USE_CHECKPOINT,
+        rope_theta=config.MODEL.ROPE_THETA,
     )
 
 
@@ -821,7 +879,7 @@ def _build_default_config():
 
     config.MODEL = CN()
     config.MODEL.TYPE = "vit_senatra"
-    config.MODEL.NAME = "vit_small_patch16_224_senatra"
+    config.MODEL.NAME = "vit_small_patch16_224_senatra_rope"
     config.MODEL.PRETRAINED = ""
     config.MODEL.RESUME = ""
     config.MODEL.NUM_CLASSES = 1000
@@ -829,6 +887,7 @@ def _build_default_config():
     config.MODEL.DROP_PATH_RATE = 0.3
     config.MODEL.LABEL_SMOOTHING = 0.1
     config.MODEL.USE_CLS_TOKEN = True
+    config.MODEL.ROPE_THETA = 100.0
 
     config.MODEL.VIT = CN()
     config.MODEL.VIT.VARIANT = "vit_small"
@@ -981,6 +1040,8 @@ def update_config(config, args):
         config.TRAIN.OPTIMIZER.NAME = args.optim
     if _check_args("img_size"):
         config.DATA.IMG_SIZE = args.img_size
+    if _check_args("rope_theta"):
+        config.MODEL.ROPE_THETA = args.rope_theta
     if _check_args("vis_freq"):
         config.VIS_FREQ = args.vis_freq
     else:
@@ -1017,7 +1078,7 @@ def get_config(args):
 
 
 def parse_option():
-    parser = argparse.ArgumentParser("ViT + SENATRA training", add_help=False)
+    parser = argparse.ArgumentParser("ViT + SENATRA + RoPE training", add_help=False)
     parser.add_argument("--cfg", type=str, default="", metavar="FILE")
     parser.add_argument("--opts", default=None, nargs="+")
     parser.add_argument("--model", type=str, default="vit_small", choices=sorted(VIT_PRESETS.keys()))
@@ -1042,6 +1103,8 @@ def parse_option():
     parser.add_argument("--vis-freq", type=int, default=1)
     parser.add_argument("--save-best-only", action="store_true")
     parser.add_argument("--img-size", type=int, default=224)
+    parser.add_argument("--rope-theta", type=float, default=None,
+                        help="RoPE base frequency theta (default 100.0)")
     parser.add_argument(
         "--senatra-resolutions",
         type=str,
