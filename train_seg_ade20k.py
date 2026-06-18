@@ -454,11 +454,12 @@ def compute_seg_loss(
             tgt_classes_full[src_idx] = tgt_lbl[tgt_idx]
             weight = torch.ones(nc + 1, device=device)
             weight[nc] = no_obj_w
-            total_ce += F.cross_entropy(c_logit[b], tgt_classes_full, weight=weight)
+            # Cast to float32: weight is always fp32; c_logit may be fp16 under AMP
+            total_ce += F.cross_entropy(c_logit[b].float(), tgt_classes_full, weight=weight)
 
             if len(src_idx) > 0:
-                pm = m_logit[b][src_idx]       # [Ks, Hm, Wm]
-                tm = tgt_msk[tgt_idx]          # [Ks, Hm, Wm]
+                pm = m_logit[b][src_idx].float()   # [Ks, Hm, Wm]  fp32 for numerical stability
+                tm = tgt_msk[tgt_idx]              # [Ks, Hm, Wm]
                 total_focal += sigmoid_focal_loss(pm.flatten(1), tm.flatten(1))
                 total_dice  += dice_loss(pm, tm)
                 n_valid += 1
